@@ -15,8 +15,17 @@ tokens, que es justo lo que se quiere ahorrar). Reglas del diagnóstico:
 Uso:
     python medir_consumo.py                # todos los proyectos
     python medir_consumo.py --dias 30      # solo lo reciente
+    python medir_consumo.py --desde "2026-09-10 22:25"   # desde un cambio
+    python medir_consumo.py --desde "2026-09-13 13:54" --hasta "2026-09-16 19:47"
     python medir_consumo.py --top 20       # más sesiones en el ranking
     python medir_consumo.py --csv salida.csv
+
+`--dias` se queda con las sesiones cuyo último mensaje cae en la ventana, enteras.
+`--desde` (hora local) corta por llamada: de una sesión que cruza el cambio cuenta solo
+lo posterior, que es lo que hace falta para medir un régimen nuevo de pocos días.
+`--hasta` cierra la ventana por arriba con el mismo corte por llamada, y con los dos se
+aísla un régimen que ya terminó: sin él, el régimen viejo queda mezclado con todo lo que
+vino después de su último día.
 
 No modifica nada: solo lee los .jsonl de ~/.claude/projects.
 """
@@ -46,15 +55,15 @@ PRECIO = {"input_tokens": 1.0, "cache_creation_input_tokens": 1.25,
 PRECIO_CACHE_1H = 2.0
 
 
-def medir_sesion(ruta):
-    """Devuelve dict con el consumo de un transcript, o None si no tiene uso."""
+def medir_sesion(ruta, desde=None, hasta=None):
+    """Devuelve dict con el consumo de un transcript, o None si no tiene uso. Con
+    `desde` (datetime con zona) cuenta solo las llamadas posteriores, y con `hasta`
+    solo las anteriores o iguales a ese momento."""
     # Claude Code escribe una línea por bloque de contenido (texto, tool_use) y
     # repite en cada una el mismo `usage`: sumar líneas contaba cada llamada ~1,9
     # veces. Se agrupa por requestId (o message.id si falta) y vale el último.
-    usos = {}          # clave de la llamada -> usage, en orden de aparición
+    usos = {}          # clave de la llamada -> (usage, timestamp), en orden de aparición
     sin_clave = 0
-    primero = None
-    ultimo = None
     ts = None
     with io.open(ruta, "r", encoding="utf-8", errors="ignore") as fh:
         for linea in fh:
@@ -74,31 +83,59 @@ def medir_sesion(ruta):
             if not clave:
                 sin_clave += 1
                 clave = ("sin_clave", sin_clave)
-            usos[clave] = u
             ts = d.get("timestamp") or ts
-            if primero is None:
-                primero = d.get("timestamp")
-            ultimo = d.get("timestamp") or ultimo
+            usos[clave] = (u, ts)
+    cortada = False
+    if desde is not None or hasta is not None:
+        from regimen import marca
+        antes = len(usos)
+        if desde is not None:
+            usos = dict((k, v) for k, v in usos.items()
+                        if (marca(v[1]) or desde) > desde)
+            # Solo el corte por abajo invalida el piso: la primera llamada que queda
+            # ya trae contexto acumulado. Recortar la cola no mueve la primera.
+            cortada = len(usos) < antes
+        if hasta is not None:
+            usos = dict((k, v) for k, v in usos.items()
+                        if (marca(v[1]) or hasta) <= hasta)
     llamadas = len(usos)
     if not llamadas:
         return None
+    marcas = sorted(m for _u, m in usos.values() if m)
     suma = dict((c, 0) for c in CAMPOS)
     cache_1h = 0
     contextos = []
-    for u in usos.values():
+    escrituras = []    # cache_creation de cada llamada, en orden: el panel la parte
+    # Costo ponderado por día local y por componente: lo usa el panel para el gráfico
+    # diario. Una sesión que cruza la medianoche reparte sus llamadas entre los dos días.
+    from regimen import marca as _marca
+    por_dia = {}
+    for u, m in usos.values():
         for c in CAMPOS:
             suma[c] += u.get(c) or 0
         desglose = u.get("cache_creation")
+        uno_h = 0
         if isinstance(desglose, dict):
-            cache_1h += desglose.get("ephemeral_1h_input_tokens") or 0
+            uno_h = desglose.get("ephemeral_1h_input_tokens") or 0
+            cache_1h += uno_h
+        momento = _marca(m)
+        if momento is not None:
+            dia = por_dia.setdefault(momento.astimezone().date(),
+                                     dict((c, 0.0) for c in CAMPOS))
+            for c in CAMPOS:
+                dia[c] += (u.get(c) or 0) * PRECIO[c]
+            dia["cache_creation_input_tokens"] += uno_h * (
+                PRECIO_CACHE_1H - PRECIO["cache_creation_input_tokens"])
+        escrituras.append(u.get("cache_creation_input_tokens") or 0)
         contextos.append((u.get("input_tokens") or 0)
                          + (u.get("cache_creation_input_tokens") or 0)
                          + (u.get("cache_read_input_tokens") or 0))
     return {
         "archivo": os.path.basename(ruta),
         "proyecto": os.path.basename(os.path.dirname(ruta)),
-        "inicio": (primero or "")[:16],
-        "fin": (ultimo or ts or "")[:16],
+        "inicio": (marcas[0] if marcas else "")[:16],
+        "fin": (marcas[-1] if marcas else "")[:16],
+        "cortada": cortada,
         "llamadas": llamadas,
         "total": sum(suma.values()),
         "input": suma["input_tokens"],
@@ -110,6 +147,8 @@ def medir_sesion(ruta):
         "ctx_prom": sum(contextos) / float(llamadas),
         "ctx_max": max(contextos),
         "contextos": contextos,
+        "escrituras": escrituras,
+        "por_dia": por_dia,
     }
 
 
@@ -128,13 +167,23 @@ def percentil(xs, p):
 
 
 def main():
+    from regimen import avisar, leer_desde, local
     ap = argparse.ArgumentParser(description="Consumo de tokens de Claude Code")
-    ap.add_argument("--dias", type=int, default=0,
-                    help="solo sesiones cuyo ultimo mensaje sea de los ultimos N dias")
+    ventana = ap.add_mutually_exclusive_group()
+    ventana.add_argument("--dias", type=int, default=0,
+                         help="solo sesiones cuyo ultimo mensaje sea de los ultimos N dias")
+    ventana.add_argument("--desde", type=leer_desde, metavar="'AAAA-MM-DD HH:MM'",
+                         help="solo las llamadas posteriores a ese momento (hora local)")
+    ap.add_argument("--hasta", type=leer_desde, metavar="'AAAA-MM-DD HH:MM'",
+                    help="cierra la ventana por arriba, con el mismo corte por llamada")
     ap.add_argument("--top", type=int, default=8, help="sesiones en el ranking")
     ap.add_argument("--csv", help="volcar el detalle por sesion a un CSV")
     ap.add_argument("--raiz", default=RAIZ, help="carpeta de proyectos de Claude Code")
     args = ap.parse_args()
+    if args.hasta and args.dias:
+        ap.error("--hasta corta por llamada y --dias por sesion: va con --desde")
+    if args.hasta and args.desde and args.hasta <= args.desde:
+        ap.error("--hasta tiene que ser posterior a --desde")
 
     patron = os.path.join(args.raiz, "*", "*.jsonl")
     rutas = glob.glob(patron)
@@ -150,7 +199,7 @@ def main():
     sesiones = []
     for r in rutas:
         try:
-            s = medir_sesion(r)
+            s = medir_sesion(r, args.desde, args.hasta)
         except Exception:
             continue
         if not s:
@@ -178,16 +227,24 @@ def main():
             "output": comp["output"] * PRECIO["output_tokens"]}
     ponderado = sum(peso.values())
     ctx_todos = [c for s in sesiones for c in s["contextos"]]
-    pisos = sorted(s["contextos"][0] for s in sesiones)
+    # El piso es la primera llamada de la sesion: de una sesion cortada por --desde,
+    # la primera llamada que quedo ya trae contexto acumulado y no es piso.
+    pisos = sorted(s["contextos"][0] for s in sesiones if not s["cortada"]) or [0]
 
     # Un promedio sobre una ventana que cruza un cambio de mecanismo no describe
     # ningun regimen. El banner sale arriba para que se vea antes que las cifras.
-    from regimen import avisar
-    avisar(dias=args.dias or None)
+    avisar(dias=args.dias or None, desde=args.desde, hasta=args.hasta)
 
     # Salida compacta a proposito (unas 25 lineas): se lee desde el chat y cada
     # linea se relee en los turnos que siguen. El detalle por sesion va al --csv.
-    ambito = "ultimos %d dias" % args.dias if args.dias else "historico completo"
+    if args.desde and args.hasta:
+        ambito = "de %s a %s" % (local(args.desde), local(args.hasta))
+    elif args.desde:
+        ambito = "desde %s" % local(args.desde)
+    elif args.hasta:
+        ambito = "hasta %s" % local(args.hasta)
+    else:
+        ambito = "ultimos %d dias" % args.dias if args.dias else "historico completo"
     print("CONSUMO DE TOKENS (%s): %d sesiones, %s llamadas"
           % (ambito, len(sesiones), format(llamadas, ",")))
     print("  volumen bruto %.1f M | cache_read %.1f M (%.0f%%) | cache_creation %.1f M "

@@ -18,7 +18,17 @@ Solo lee los .jsonl de ~/.claude/projects. No modifica nada.
     python medir_tool_results.py --dias 30
     python medir_tool_results.py --dias 30 --top 25
     python medir_tool_results.py --dias 30 --csv detalle.csv
+    python medir_tool_results.py --desde "2026-09-10 22:25"
+    python medir_tool_results.py --desde "2026-09-13 13:54" --hasta "2026-09-16 19:47"
     python medir_tool_results.py --sesion <archivo.jsonl>
+
+`--dias` toma las sesiones que empezaron en la ventana, enteras. `--desde` (hora local)
+corta por tool_result: de una sesion que cruza el cambio cuenta solo los posteriores, y
+su arrastre sigue contando los turnos que vinieron despues, que ya son todos del regimen.
+`--hasta` cierra la ventana por arriba y con el mismo criterio: deja fuera los
+tool_result posteriores y tambien los turnos posteriores, asi que el arrastre que se
+informa es el que ocurrio dentro de la ventana, no el que siguio corriendo despues.
+Un arrastre cortado por arriba es un piso del costo real de esa llamada.
 """
 
 import argparse
@@ -95,8 +105,14 @@ def _cerrar(tramo, turnos):
     del tramo[:]
 
 
-def medir_sesion(ruta):
-    """Lista de dicts, uno por tool_result, con su arrastre ya calculado."""
+def medir_sesion(ruta, desde=None, hasta=None):
+    """Lista de dicts, uno por tool_result, con su arrastre ya calculado. Con `desde`
+    (datetime con zona) se omiten los tool_result anteriores; los turnos se cuentan
+    igual, porque de ellos depende el arrastre de los que quedan. Con `hasta` se omiten
+    los tool_result posteriores y tambien dejan de contarse los turnos posteriores: el
+    arrastre informado es el que ocurrio dentro de la ventana."""
+    if desde is not None or hasta is not None:
+        from regimen import marca as _marca
     usos = {}          # tool_use_id -> (nombre, breve)
     resultados = []    # todos los tool_result de la sesion
     tramo = []         # los de este tramo entre compactaciones, aun sin arrastre
@@ -129,6 +145,10 @@ def medir_sesion(ruta):
                 if inicio is None:
                     inicio = marca
                 fin = marca
+            # Pasado el tope no se cuenta nada mas: ni turnos ni resultados. Se sigue
+            # leyendo el archivo porque los tool_use de mas arriba ya estan en `usos`.
+            if hasta is not None and not ((_marca(marca) or hasta) <= hasta):
+                continue
 
             # Una llamada ocupa una línea por bloque de contenido, todas con el
             # mismo `usage`: se cuenta una vez por requestId (o message.id).
@@ -151,6 +171,8 @@ def medir_sesion(ruta):
                     usos[bloque.get("id")] = (bloque.get("name") or "?",
                                               _breve(bloque.get("input")))
                 elif tipo == "tool_result":
+                    if desde is not None and not ((_marca(marca) or desde) > desde):
+                        continue
                     nombre, breve = usos.get(bloque.get("tool_use_id"),
                                              ("?", ""))
                     chars = _texto_resultado(bloque.get("content"))
@@ -191,17 +213,37 @@ def _corto(nombre):
     return MCP_UUID.sub("", nombre or "?")
 
 
+def _ambito(args):
+    """La ventana pedida, para la primera linea del resumen."""
+    from regimen import local
+    if args.desde and args.hasta:
+        return " | de %s a %s" % (local(args.desde), local(args.hasta))
+    if args.desde:
+        return " | desde %s" % local(args.desde)
+    if args.hasta:
+        return " | hasta %s" % local(args.hasta)
+    return ""
+
+
 def main():
+    from regimen import avisar, leer_desde, local
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dias", type=int, default=30,
-                   help="ventana hacia atras (por defecto 30)")
+    ventana = p.add_mutually_exclusive_group()
+    ventana.add_argument("--dias", type=int, default=30,
+                         help="ventana hacia atras (por defecto 30)")
+    ventana.add_argument("--desde", type=leer_desde, metavar="'AAAA-MM-DD HH:MM'",
+                         help="solo los tool_result posteriores a ese momento (hora local)")
+    p.add_argument("--hasta", type=leer_desde, metavar="'AAAA-MM-DD HH:MM'",
+                   help="cierra la ventana por arriba, con el mismo corte por tool_result")
     p.add_argument("--top", type=int, default=6,
                    help="cuantas llamadas individuales listar")
     p.add_argument("--csv", help="ruta para el detalle completo, un tool_result por fila")
     p.add_argument("--sesion", help="medir un solo transcript (ruta o nombre de archivo)")
     p.add_argument("--raiz", default=RAIZ)
     args = p.parse_args()
+    if args.hasta and args.desde and args.hasta <= args.desde:
+        p.error("--hasta tiene que ser posterior a --desde")
 
     if hasattr(sys.stdout, "buffer"):
         sys.stdout = codecs.getwriter("utf-8")(sys.stdout.buffer, "replace")
@@ -220,13 +262,13 @@ def main():
     sesiones = 0
     for ruta in rutas:
         try:
-            filas, turnos, ini, _fin = medir_sesion(ruta)
+            filas, turnos, ini, _fin = medir_sesion(ruta, args.desde, args.hasta)
         except Exception as e:
             print("  (se omite %s: %s)" % (os.path.basename(ruta), e))
             continue
         if not filas:
             continue
-        if not args.sesion:
+        if not args.sesion and not args.desde and not args.hasta:
             f = _fecha(ini)
             if f is None or f < corte:
                 continue
@@ -240,13 +282,14 @@ def main():
     total_tokens = sum(r["tokens"] for r in todo)
     total_arrastre = sum(r["arrastre"] for r in todo)
 
-    from regimen import avisar
-    avisar(dias=args.dias or None)
+    avisar(dias=None if (args.desde or args.hasta) else (args.dias or None),
+           desde=args.desde, hasta=args.hasta)
 
     # Salida compacta a proposito (unas 28 lineas): se lee desde el chat y cada
     # linea se relee en los turnos que siguen. El detalle completo va al --csv.
-    print("Sesiones: %d | tool_result: %s | tokens entregados: %s | arrastre: %s"
-          % (sesiones, _miles(len(todo)), _miles(total_tokens), _miles(total_arrastre)))
+    print("Sesiones: %d | tool_result: %s | tokens entregados: %s | arrastre: %s%s"
+          % (sesiones, _miles(len(todo)), _miles(total_tokens), _miles(total_arrastre),
+             _ambito(args)))
     print("(arrastre = tokens x turnos posteriores, reiniciado en cada compactacion)")
     print("")
 

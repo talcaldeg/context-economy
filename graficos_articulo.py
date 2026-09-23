@@ -259,7 +259,7 @@ def grafico_deriva(sesiones, destino, minimo=120, tramos=10):
     ax.plot(xs, medias, color=ACENTO, lw=2.4, marker="o", ms=6, zorder=3)
     ax.fill_between(xs, [medias[0]] * tramos, medias, color=ACENTO, alpha=0.10)
     ax.axhline(medias[0], color=GRIS, ls="--", lw=1.4)
-    ax.text(1.15, medias[0] * 1.03, t("deriva.arranque"), va="bottom",
+    ax.text(1.15, medias[0] * 0.94, t("deriva.arranque"), va="top",
             ha="left", color=GRIS, fontsize=10)
     ax.annotate(u"×%.1f" % (medias[-1] / medias[0]),
                 xy=(tramos, medias[-1]), xytext=(-6, 10),
