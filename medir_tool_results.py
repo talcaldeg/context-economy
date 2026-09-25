@@ -44,8 +44,10 @@ import sys
 
 RAIZ = os.path.join(os.path.expanduser("~"), ".claude", "projects")
 
-# 1 token ~ 4 caracteres. Sirve para ordenar, no para facturar.
-CHARS_POR_TOKEN = 4.0
+# Caracteres por token: de calibracion.py, la unica fuente. Hasta el 25-sep-2026 aca era
+# 4,0 y los tokens de cada resultado quedaban bajos cerca de 1,9 veces.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from calibracion import CHARS_POR_TOKEN  # noqa: E402
 
 # Filas de la tabla por herramienta antes de agrupar el resto.
 TOP_HERRAMIENTAS = 8

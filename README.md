@@ -116,8 +116,16 @@ The article's figures were computed before the `requestId` deduplication and the
 above: 313 sessions, 2,356 M tokens, 94 % `cache_read`, a fit of `cost ∝ turns^1.20` with R² 0.97,
 and 54 % of the carry coming from reading whole files. The same command against my transcripts
 now prints 294 sessions, 1,212 M tokens, 96 % `cache_read`, `cost ∝ turns^1.19` with R² 0.97, and
-55 % of a 181 M carry from reading whole files. The totals halve; the shape of the argument does
-not move. Against your transcripts it will print something else, which is the point: what is
+55 % of a 345 M carry from reading whole files. The totals halve; the shape of the argument does
+not move.
+
+The carry had a second, opposite error. Converting a tool result's characters to tokens used
+4 characters per token, the figure that circulates; calibrated against the jump in context
+between consecutive calls, these transcripts give about 2.1 (see `calibracion.py`, fixed on
+25 Sep 2026). That made each result about 1.9 times too small, while the double count made the
+turns after it about 1.9 times too many, so the published 380 M carry was close by accident:
+with both fixes it is 345 M. Averages per call only had the first error: the mail connector
+went from 2,730 to 5,178 tokens per call. Against your transcripts it will print something else, which is the point: what is
 worth having is the ranking of your own transcripts, not mine.
 
 ## Requirements
